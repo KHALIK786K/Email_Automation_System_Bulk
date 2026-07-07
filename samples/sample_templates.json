@@ -1,0 +1,17 @@
+[
+  {
+    "name": "Interview Shortlist",
+    "subject": "Interview Opportunity at {{company_name}}",
+    "body": "Dear {{student_name}},\n\nCongratulations! You have been shortlisted for the {{job_role}} position at {{company_name}}.\n\nInterview Date: {{deadline}}\nMeeting Link: {{meeting_link}}\n\nPlease be available 10 minutes before the scheduled time.\n\n{{signature}}"
+  },
+  {
+    "name": "Application Reminder",
+    "subject": "Reminder: Apply for {{job_role}} at {{company_name}}",
+    "body": "Dear {{student_name}},\n\nThis is a gentle reminder to complete your application for the {{job_role}} role at {{company_name}}.\n\nDeadline: {{deadline}}\nApply here: {{meeting_link}}\n\nDo not miss this opportunity!\n\n{{signature}}"
+  },
+  {
+    "name": "Offer Congratulations",
+    "subject": "Congratulations! Offer from {{company_name}}",
+    "body": "Dear {{student_name}},\n\nWe are delighted to inform you that {{company_name}} has extended an offer for the {{job_role}} position.\n\nPlease review the details and respond by {{deadline}}.\n\n{{signature}}"
+  }
+]

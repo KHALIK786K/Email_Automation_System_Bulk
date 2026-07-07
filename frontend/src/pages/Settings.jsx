@@ -1,0 +1,128 @@
+import { useEffect, useState } from "react";
+import { api } from "../lib/api.js";
+import { useToast } from "../lib/toast.jsx";
+import { IconCheck } from "../components/Icons.jsx";
+
+export default function Settings() {
+  const toast = useToast();
+  const [s, setS] = useState(null);
+  const [testing, setTesting] = useState(false);
+
+  useEffect(() => { api.get("/settings").then(({ data }) => setS(data)); }, []);
+
+  const save = async () => {
+    await api.put("/settings", s);
+    toast.success("Settings saved");
+  };
+
+  const test = async () => {
+    setTesting(true);
+    try {
+      // Save first so the test uses latest values
+      await api.put("/settings", s);
+      const { data } = await api.post("/settings/test");
+      toast.success(data.message);
+    } catch (e) {
+      toast.error(e.response?.data?.message || "Connection failed");
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  if (!s) return <div className="text-slate-500">Loading…</div>;
+
+  return (
+    <div className="max-w-2xl space-y-6">
+      <div>
+        <h1 className="text-2xl font-extrabold">Settings</h1>
+        <p className="text-sm text-slate-500">Gmail SMTP credentials & signature</p>
+      </div>
+
+      <div className="card space-y-4 p-5">
+        <h2 className="font-bold">Gmail Connection</h2>
+        <div className="rounded-lg bg-amber-50 p-3 text-xs text-amber-800 dark:bg-amber-900/20 dark:text-amber-300">
+          Use a Gmail <b>App Password</b> (not your login password). Enable 2-Step Verification, then create an App Password at
+          <span className="font-mono"> myaccount.google.com → Security → App passwords</span>.
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div>
+            <label className="label">SMTP Host</label>
+            <input className="input" value={s.smtp_host} onChange={(e) => setS({ ...s, smtp_host: e.target.value })} />
+          </div>
+          <div>
+            <label className="label">SMTP Port</label>
+            <input className="input" value={s.smtp_port} onChange={(e) => setS({ ...s, smtp_port: e.target.value })} />
+          </div>
+        </div>
+        <div>
+          <label className="label">Gmail Address</label>
+          <input className="input" value={s.gmail_user} onChange={(e) => setS({ ...s, gmail_user: e.target.value })}
+            placeholder="you@gmail.com" />
+        </div>
+        <div>
+          <label className="label">App Password</label>
+          <input type="password" className="input" value={s.gmail_app_password}
+            onChange={(e) => setS({ ...s, gmail_app_password: e.target.value })}
+            placeholder="16-character app password" />
+        </div>
+        <div className="flex gap-2">
+          <button className="btn btn-primary" onClick={save}>Save</button>
+          <button className="btn btn-ghost" onClick={test} disabled={testing}>
+            {testing ? "Testing…" : <><IconCheck /> Test Connection</>}
+          </button>
+        </div>
+      </div>
+
+      <div className="card space-y-4 p-5">
+        <h2 className="font-bold">Sender & Signature</h2>
+        <div>
+          <label className="label">Sender Name</label>
+          <input className="input" value={s.sender_name} onChange={(e) => setS({ ...s, sender_name: e.target.value })} />
+        </div>
+        <div>
+          <label className="label">Signature (available as <code>{"{{signature}}"}</code>)</label>
+          <textarea rows={4} className="input" value={s.signature}
+            onChange={(e) => setS({ ...s, signature: e.target.value })} />
+        </div>
+        <button className="btn btn-primary" onClick={save}>Save</button>
+      </div>
+
+      <div className="card space-y-4 p-5">
+        <h2 className="font-bold">College Profile</h2>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div>
+            <label className="label">College Name</label>
+            <input className="input" value={s.college_name || ""}
+              onChange={(e) => setS({ ...s, college_name: e.target.value })} />
+          </div>
+          <div>
+            <label className="label">College Location</label>
+            <input className="input" value={s.college_location || ""}
+              onChange={(e) => setS({ ...s, college_location: e.target.value })} />
+          </div>
+          <div>
+            <label className="label">Placement Officer</label>
+            <input className="input" value={s.placement_officer || ""}
+              onChange={(e) => setS({ ...s, placement_officer: e.target.value })} />
+          </div>
+          <div>
+            <label className="label">Contact Number</label>
+            <input className="input" value={s.contact_number || ""}
+              onChange={(e) => setS({ ...s, contact_number: e.target.value })} />
+          </div>
+          <div>
+            <label className="label">Website</label>
+            <input className="input" value={s.website || ""}
+              onChange={(e) => setS({ ...s, website: e.target.value })} />
+          </div>
+          <div>
+            <label className="label">Brochure Link</label>
+            <input className="input" value={s.brochure_link || ""}
+              onChange={(e) => setS({ ...s, brochure_link: e.target.value })} />
+          </div>
+        </div>
+        <button className="btn btn-primary" onClick={save}>Save</button>
+      </div>
+    </div>
+  );
+}
