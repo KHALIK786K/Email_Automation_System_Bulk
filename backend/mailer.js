@@ -44,18 +44,54 @@ export function renderTemplate(text, row, extra = {}) {
   });
 }
 
+/**
+ * Build a plain-text + HTML footer with sender identity and an unsubscribe line.
+ * The unsubscribe uses a mailto: link (no web server needed) — the recipient's
+ * request lands in the sender's inbox with subject "unsubscribe".
+ */
+function buildFooter(s) {
+  const orgName = s.college_name || s.sender_name || "Placement Cell";
+  const location = s.college_location || "";
+  const unsubMailto = `mailto:${s.gmail_user}?subject=unsubscribe`;
+
+  const text =
+    `\n\n---\n${orgName}` +
+    (location ? `\n${location}` : "") +
+    `\n\nYou received this email because your address is on our placement contact list.` +
+    `\nTo stop receiving these emails, reply with "unsubscribe" or email ${s.gmail_user}.`;
+
+  const html =
+    `<hr style="margin-top:24px;border:none;border-top:1px solid #ddd">` +
+    `<div style="font-size:12px;color:#888;margin-top:8px;line-height:1.5">` +
+    `<strong>${orgName}</strong>` +
+    (location ? `<br>${location}` : "") +
+    `<br><br>You received this email because your address is on our placement contact list.` +
+    `<br>To stop receiving these emails, ` +
+    `<a href="${unsubMailto}" style="color:#888">unsubscribe here</a>.` +
+    `</div>`;
+
+  return { text, html, unsubMailto };
+}
+
 /** Send a single email. attachments = [{ filename, path }]. */
 export async function sendOne({ to, subject, body, attachments = [] }) {
   const s = getSettings();
   const transporter = buildTransporter();
   const fromName = s.sender_name || "Placement Cell";
+  const footer = buildFooter(s);
+
   await transporter.sendMail({
     from: `"${fromName}" <${s.gmail_user}>`,
     to,
     subject,
-    text: body,
-    html: body.replace(/\n/g, "<br>"),
+    text: body + footer.text,
+    html: body.replace(/\n/g, "<br>") + footer.html,
     attachments,
+    // Lets Gmail/Outlook show a native "Unsubscribe" button — a strong
+    // deliverability signal that helps keep bulk mail out of spam.
+    headers: {
+      "List-Unsubscribe": `<${footer.unsubMailto}>`,
+    },
   });
   return true;
 }

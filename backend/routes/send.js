@@ -240,8 +240,8 @@ router.get("/process/:batchId", async (req, res) => {
       });
     }
 
-    // Small delay to be gentle on Gmail rate limits
-    await new Promise((r) => setTimeout(r, 300));
+    // Delay between emails to be gentle on Gmail rate limits / reduce spam flags
+    await new Promise((r) => setTimeout(r, 2000));
   }
 
   send("done", { sent, failed, total: pending.length });

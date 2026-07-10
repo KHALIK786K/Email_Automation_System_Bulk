@@ -37,7 +37,7 @@ export function startScheduler() {
           item.id
         );
       }
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise((r) => setTimeout(r, 2000));
     }
   }, 30000);
 
