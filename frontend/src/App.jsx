@@ -10,6 +10,7 @@ import History from "./pages/History.jsx";
 import Analytics from "./pages/Analytics.jsx";
 import Settings from "./pages/Settings.jsx";
 import Calendar from "./pages/Calendar.jsx";
+import FollowUps from "./pages/FollowUps.jsx";
 
 // Login is optional: set to false to skip it entirely.
 const REQUIRE_LOGIN = true;
@@ -38,6 +39,7 @@ export default function App() {
         <Route path="/companies" element={<Companies />} />
         <Route path="/compose" element={<Compose />} />
         <Route path="/templates" element={<Templates />} />
+        <Route path="/follow-ups" element={<FollowUps />} />
         <Route path="/history" element={<History />} />
         <Route path="/calendar" element={<Calendar />} />
         <Route path="/analytics" element={<Analytics />} />

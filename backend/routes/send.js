@@ -6,7 +6,7 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
 import db from "../db/database.js";
-import { renderTemplate, sendOne } from "../mailer.js";
+import { renderTemplate, sendOne, markdownToHtml } from "../mailer.js";
 import { getSettings } from "../db/settings.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -19,22 +19,14 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
-// In-memory control flags per batch (cancel only)
-const batchControl = new Map(); // batchId -> { cancelled: bool }
+// In-memory control flags per batch (cancel / running state)
+const batchControl = new Map();
+
+// Batch IDs currently being processed — prevents concurrent duplicate sends.
+const runningBatches = new Set();
 
 function recipientEmail(row = {}) {
   return String(row.email || row.hr_email || row.company_email || "").trim().toLowerCase();
-}
-
-// Safely parse the attachments JSON stored on a history row.
-function parseAttachments(json) {
-  if (!json) return [];
-  try {
-    const arr = JSON.parse(json);
-    return Array.isArray(arr) ? arr : [];
-  } catch {
-    return [];
-  }
 }
 
 function templateExtra(settings) {
@@ -79,7 +71,7 @@ function upsertCompanyFromRow(row = {}) {
       job_role = COALESCE(NULLIF(excluded.job_role, ''), companies.job_role),
       brochure_link = COALESCE(NULLIF(excluded.brochure_link, ''), companies.brochure_link),
       notes = COALESCE(NULLIF(excluded.notes, ''), companies.notes),
-      updated_at = datetime('now','localtime')
+      updated_at = datetime('now')
   `).run(
     companyName,
     row.hr_name || row.contact_name || "",
@@ -105,17 +97,26 @@ function upsertCompanyFromRow(row = {}) {
 function markCompanyContacted(email) {
   db.prepare(`
     UPDATE companies
-    SET last_contact_date = date('now','localtime'),
+    SET last_contact_date = date('now'),
         status = CASE WHEN status = 'New' THEN 'Contacted' ELSE status END,
-        updated_at = datetime('now','localtime')
+        updated_at = datetime('now')
     WHERE hr_email = ?
   `).run(email);
 }
 
-// Set of every email address already sent successfully.
-function alreadySentSet() {
-  const rows = db.prepare("SELECT DISTINCT email FROM history WHERE status = 'sent'").all();
-  return new Set(rows.map((r) => String(r.email || "").trim().toLowerCase()));
+/**
+ * Attachments for one history row.
+ * The DB column is authoritative; the in-memory batch Map is only a fallback
+ * for rows queued before this column existed.
+ */
+function rowAttachments(item, fallback = []) {
+  if (!item.attachments) return fallback;
+  try {
+    const parsed = JSON.parse(item.attachments);
+    return Array.isArray(parsed) ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 // ---- Upload attachments (returns stored paths) ----
@@ -129,45 +130,8 @@ router.post("/attachments", upload.array("files", 20), (req, res) => {
 });
 
 /**
- * Check which recipients were already emailed before (status = 'sent').
- * body: { rows } -> returns counts + list, sends nothing.
- */
-router.post("/check-duplicates", (req, res) => {
-  const { rows = [] } = req.body;
-
-  const seen = new Set();
-  const uniqueEmails = [];
-  for (const row of rows) {
-    const email = recipientEmail(row);
-    if (!email || seen.has(email)) continue;
-    seen.add(email);
-    uniqueEmails.push(email);
-  }
-
-  const sent = alreadySentSet();
-  const detail = db.prepare(
-    "SELECT company, MAX(sent_at) AS sent_at FROM history WHERE email = ? AND status = 'sent'"
-  );
-
-  const alreadyContacted = [];
-  for (const email of uniqueEmails) {
-    if (sent.has(email)) {
-      const d = detail.get(email) || {};
-      alreadyContacted.push({ email, company: d.company || "", sent_at: d.sent_at || "" });
-    }
-  }
-
-  res.json({
-    total: rows.length,
-    unique: uniqueEmails.length,
-    alreadyCount: alreadyContacted.length,
-    freshCount: uniqueEmails.length - alreadyContacted.length,
-    alreadyContacted,
-  });
-});
-
-/**
  * Preview: render subject+body for each row without sending.
+ * body: { templateId, rows }
  */
 router.post("/preview", (req, res) => {
   const { templateId, rows = [] } = req.body;
@@ -175,73 +139,89 @@ router.post("/preview", (req, res) => {
   if (!tpl) return res.status(404).json({ error: "Template not found" });
   const s = getSettings();
 
-  const preview = rows.slice(0, 200).map((row) => ({
-    email: recipientEmail(row),
-    student_name: row.student_name || row.hr_name || "",
-    subject: renderTemplate(tpl.subject, row, templateExtra(s)),
-    body: renderTemplate(tpl.body, row, templateExtra(s)),
-  }));
+  const preview = rows.slice(0, 200).map((row) => {
+    const body = renderTemplate(tpl.body, row, templateExtra(s));
+    return {
+      email: recipientEmail(row),
+      student_name: row.student_name || row.hr_name || "",
+      subject: renderTemplate(tpl.subject, row, templateExtra(s)),
+      body,
+      // Exactly what the recipient's mail client will render, so the preview
+      // isn't showing raw ** markers for text that will arrive bold.
+      bodyHtml: markdownToHtml(body),
+    };
+  });
   res.json({ preview, count: rows.length });
 });
 
 /**
- * Queue a batch. body: { templateId, rows, attachments, scheduledAt, resendContacted }
- * - de-dupes within the list, skips already-contacted (unless resendContacted),
- * - stores attachments ON EACH history row (JSON) so scheduled/resume sends keep them.
+ * Which of these recipients have already been mailed recently?
+ * body: { rows, days }  ->  { duplicates: [{ email, company, last_sent_at, times }] }
+ *
+ * Called before queueing so the coordinator can decide what to do. Mailing the
+ * same HR contact twice in a few weeks is how a placement cell gets ignored —
+ * and on a shared mailbox it is easy to do by accident, because another
+ * coordinator may have already contacted them.
+ */
+router.post("/check-duplicates", (req, res) => {
+  const { rows = [], days = 30 } = req.body;
+  if (!rows.length) return res.json({ duplicates: [] });
+
+  const lookup = db.prepare(
+    `SELECT email, company, MAX(sent_at) AS last_sent_at, COUNT(*) AS times
+     FROM history
+     WHERE lower(email) = ?
+       AND status = 'sent'
+       AND sent_at IS NOT NULL
+       AND julianday('now') - julianday(sent_at) <= ?
+     GROUP BY lower(email)`
+  );
+
+  const seen = new Set();
+  const duplicates = [];
+
+  for (const row of rows) {
+    const email = recipientEmail(row);
+    if (!email || seen.has(email)) continue;
+    seen.add(email);
+
+    const hit = lookup.get(email, Number(days));
+    if (hit) {
+      duplicates.push({
+        email,
+        company: row.company_name || row.company || hit.company || "",
+        last_sent_at: hit.last_sent_at,
+        times: hit.times,
+        days_ago: Math.floor(
+          (Date.now() - new Date(hit.last_sent_at.replace(" ", "T") + "Z")) / 86400000
+        ),
+      });
+    }
+  }
+
+  res.json({ duplicates, checked: seen.size, days: Number(days) });
+});
+
+/**
+ * Queue a batch. body: { templateId, rows, attachments, scheduledAt }
+ * Creates history entries with status 'pending' and returns batchId.
  */
 router.post("/queue", (req, res) => {
-  const {
-    templateId,
-    rows = [],
-    attachments = [],
-    scheduledAt = null,
-    resendContacted = false,
-  } = req.body;
-
+  const { templateId, rows = [], attachments = [], scheduledAt = null } = req.body;
   const tpl = db.prepare("SELECT * FROM templates WHERE id = ?").get(templateId);
   if (!tpl) return res.status(404).json({ error: "Template not found" });
   if (!rows.length) return res.status(400).json({ error: "No recipients" });
 
   const s = getSettings();
-  const attachmentsJson = JSON.stringify(attachments || []);
-
-  // de-dupe within this batch
-  const seen = new Set();
-  const deduped = [];
-  let dupInBatch = 0;
-  for (const row of rows) {
-    const email = recipientEmail(row);
-    if (!email) continue;
-    if (seen.has(email)) { dupInBatch++; continue; }
-    seen.add(email);
-    deduped.push(row);
-  }
-
-  // skip already-contacted unless re-sending
-  const sent = alreadySentSet();
-  let skippedSent = 0;
-  const finalRows = [];
-  for (const row of deduped) {
-    if (!resendContacted && sent.has(recipientEmail(row))) { skippedSent++; continue; }
-    finalRows.push(row);
-  }
-
-  if (!finalRows.length) {
-    return res.status(400).json({
-      error: "Nothing to send — all recipients were duplicates or already contacted.",
-      dupInBatch,
-      skippedSent,
-    });
-  }
-
   const batchId = randomUUID();
+  const attachmentsJson = attachments.length ? JSON.stringify(attachments) : null;
   const insert = db.prepare(`
-    INSERT INTO history (student_name, email, company, role, subject, body, status, template_id, batch_id, attachments, scheduled_at)
-    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+    INSERT INTO history (student_name, email, company, role, subject, body, status, template_id, batch_id, scheduled_at, in_reply_to, attachments)
+    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
   `);
 
   const tx = db.transaction(() => {
-    for (const row of finalRows) {
+    for (const row of rows) {
       const body = renderTemplate(tpl.body, row, templateExtra(s));
       const subject = renderTemplate(tpl.subject, row, templateExtra(s));
       const email = recipientEmail(row);
@@ -251,25 +231,27 @@ router.post("/queue", (req, res) => {
         email,
         row.company_name || row.company || "",
         row.job_role || row.role || "",
-        subject, body, templateId, batchId, attachmentsJson, scheduledAt
+        subject,
+        body,
+        templateId,
+        batchId,
+        scheduledAt,
+        row.__in_reply_to || null,
+        attachmentsJson
       );
     }
   });
   tx();
 
-  batchControl.set(batchId, { cancelled: false });
-  res.status(201).json({
-    batchId,
-    queued: finalRows.length,
-    dupInBatch,
-    skippedSent,
-    resendContacted,
-    scheduledAt,
-  });
+  // Store attachments association on the batch (in-memory + we pass at send time)
+  batchControl.set(batchId, { cancelled: false, attachments });
+
+  res.status(201).json({ batchId, queued: rows.length, scheduledAt });
 });
 
 /**
  * Process a batch now (streams progress via SSE).
+ * GET /send/process/:batchId
  */
 router.get("/process/:batchId", async (req, res) => {
   const { batchId } = req.params;
@@ -278,56 +260,73 @@ router.get("/process/:batchId", async (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders?.();
 
-  const control = batchControl.get(batchId) || { cancelled: false };
+  const control = batchControl.get(batchId) || { cancelled: false, attachments: [] };
   batchControl.set(batchId, control);
+  const attachments = control.attachments || [];
+
+  const send = (event, data) =>
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
+  // GUARD 1 — one processor per batch.
+  // EventSource reconnects on its own, and the Resume button opens a second
+  // stream. Without this, two loops read the same 'pending' rows and every
+  // recipient gets the mail twice.
+  if (runningBatches.has(batchId)) {
+    send("error", { message: "This batch is already being sent." });
+    return res.end();
+  }
+  runningBatches.add(batchId);
+
+  // GUARD 2 — stop work if the browser goes away, instead of sending into the void.
+  let aborted = false;
+  req.on("close", () => { aborted = true; });
 
   const pending = db
     .prepare("SELECT * FROM history WHERE batch_id = ? AND status IN ('pending','failed')")
     .all(batchId);
 
-  const send = (event, data) =>
-    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-
   send("start", { total: pending.length });
 
   let sent = 0;
   let failed = 0;
-  let skipped = 0;
 
   for (let i = 0; i < pending.length; i++) {
     if (batchControl.get(batchId)?.cancelled) {
       send("cancelled", { sent, failed, remaining: pending.length - i });
+      runningBatches.delete(batchId);
       res.end();
       return;
     }
 
+    if (aborted) break;
+
     const item = pending[i];
 
-    // Guard: if this address already went out in a PREVIOUS batch, skip it.
-    const alreadyElsewhere = db.prepare(
-      "SELECT 1 FROM history WHERE email = ? AND status = 'sent' AND batch_id != ? LIMIT 1"
-    ).get(item.email, batchId);
-    if (alreadyElsewhere) {
-      db.prepare("UPDATE history SET status = 'skipped', error = 'Already contacted earlier' WHERE id = ?").run(item.id);
-      skipped++;
-      send("progress", { index: i + 1, total: pending.length, email: item.email, status: "skipped" });
-      continue;
-    }
+    // GUARD 3 — claim the row atomically. If another process already moved it
+    // out of 'pending', changes === 0 and we skip instead of sending twice.
+    const claimed = db
+      .prepare(
+        "UPDATE history SET status = 'sending' WHERE id = ? AND status IN ('pending','failed')"
+      )
+      .run(item.id);
+    if (claimed.changes === 0) continue;
 
-    db.prepare("UPDATE history SET status = 'sending' WHERE id = ?").run(item.id);
     send("progress", { index: i + 1, total: pending.length, email: item.email, status: "sending" });
 
     try {
-      await sendOne({
+      const result = await sendOne({
         to: item.email,
         subject: item.subject,
         body: item.body,
-        attachments: parseAttachments(item.attachments),
+        attachments: rowAttachments(item, attachments),
+        inReplyTo: item.in_reply_to || null,
       });
       markCompanyContacted(item.email);
       db.prepare(
-        "UPDATE history SET status = 'sent', sent_at = datetime('now','localtime'), error = NULL WHERE id = ?"
-      ).run(item.id);
+        `UPDATE history
+         SET status = 'sent', sent_at = datetime('now'), error = NULL, message_id = ?
+         WHERE id = ?`
+      ).run(result?.messageId || null, item.id);
       sent++;
       send("progress", { index: i + 1, total: pending.length, email: item.email, status: "sent" });
     } catch (err) {
@@ -345,12 +344,111 @@ router.get("/process/:batchId", async (req, res) => {
       });
     }
 
-    // Small delay to be gentle on Gmail rate limits
-    await new Promise((r) => setTimeout(r, 300));
+    // Delay between emails to be gentle on Gmail rate limits / reduce spam flags
+    await new Promise((r) => setTimeout(r, 2000));
   }
 
-  send("done", { sent, failed, skipped, total: pending.length });
+  runningBatches.delete(batchId);
+  send("done", { sent, failed, total: pending.length });
   res.end();
+});
+
+/**
+ * Batches that are queued but not sent yet.
+ * Grouped by batch so the UI can cancel or move the whole send in one action.
+ */
+router.get("/scheduled", (req, res) => {
+  const rows = db
+    .prepare(
+      `SELECT h.batch_id,
+              h.scheduled_at,
+              COUNT(*)                                   AS total,
+              SUM(h.status = 'pending')                  AS pending,
+              SUM(h.status = 'sent')                     AS sent,
+              MIN(h.subject)                             AS subject,
+              t.name                                     AS template_name,
+              GROUP_CONCAT(DISTINCT h.company)           AS companies
+       FROM history h
+       LEFT JOIN templates t ON t.id = h.template_id
+       WHERE h.scheduled_at IS NOT NULL
+         AND h.status = 'pending'
+       GROUP BY h.batch_id, h.scheduled_at
+       ORDER BY h.scheduled_at ASC`
+    )
+    .all();
+  res.json(rows);
+});
+
+/**
+ * Cancel a scheduled batch. Only rows still waiting are cancelled — anything
+ * already sent stays in history, because it genuinely went out.
+ */
+router.post("/scheduled/:batchId/cancel", (req, res) => {
+  const result = db
+    .prepare("UPDATE history SET status = 'cancelled' WHERE batch_id = ? AND status = 'pending'")
+    .run(req.params.batchId);
+
+  const control = batchControl.get(req.params.batchId);
+  if (control) control.cancelled = true;
+
+  res.json({ ok: true, cancelled: result.changes });
+});
+
+/** Move a scheduled batch to a different time. */
+router.post("/scheduled/:batchId/reschedule", (req, res) => {
+  const { scheduledAt } = req.body || {};
+  if (!scheduledAt) return res.status(400).json({ error: "scheduledAt is required" });
+
+  const result = db
+    .prepare(
+      "UPDATE history SET scheduled_at = ? WHERE batch_id = ? AND status = 'pending'"
+    )
+    .run(scheduledAt, req.params.batchId);
+  res.json({ ok: true, moved: result.changes });
+});
+
+/** Undo a cancel, as long as nothing has been sent in the meantime. */
+router.post("/scheduled/:batchId/restore", (req, res) => {
+  const result = db
+    .prepare("UPDATE history SET status = 'pending' WHERE batch_id = ? AND status = 'cancelled'")
+    .run(req.params.batchId);
+  res.json({ ok: true, restored: result.changes });
+});
+
+/**
+ * Cancel individual queued rows (used from the History page).
+ * body: { ids: [1,2,3] }
+ * Only rows still waiting can be cancelled — 'sent' rows are left untouched.
+ */
+router.post("/rows/cancel", (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+  if (!ids.length) return res.status(400).json({ error: "No rows selected" });
+
+  const stmt = db.prepare(
+    "UPDATE history SET status = 'cancelled' WHERE id = ? AND status IN ('pending','failed')"
+  );
+  let cancelled = 0;
+  db.transaction(() => {
+    for (const id of ids) cancelled += stmt.run(id).changes;
+  })();
+
+  res.json({ ok: true, cancelled, skipped: ids.length - cancelled });
+});
+
+/** Put cancelled rows back in the queue. */
+router.post("/rows/restore", (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+  if (!ids.length) return res.status(400).json({ error: "No rows selected" });
+
+  const stmt = db.prepare(
+    "UPDATE history SET status = 'pending' WHERE id = ? AND status = 'cancelled'"
+  );
+  let restored = 0;
+  db.transaction(() => {
+    for (const id of ids) restored += stmt.run(id).changes;
+  })();
+
+  res.json({ ok: true, restored });
 });
 
 // Cancel a running batch
@@ -362,7 +460,7 @@ router.post("/cancel/:batchId", (req, res) => {
 
 // Resume: clear cancel flag (re-run process endpoint to continue pending)
 router.post("/resume/:batchId", (req, res) => {
-  const c = batchControl.get(req.params.batchId) || {};
+  const c = batchControl.get(req.params.batchId) || { attachments: [] };
   c.cancelled = false;
   batchControl.set(req.params.batchId, c);
   res.json({ ok: true });

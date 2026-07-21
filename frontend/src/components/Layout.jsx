@@ -4,7 +4,7 @@ import { initTheme, setTheme } from "../lib/theme.js";
 import {
   IconDashboard, IconTemplate, IconSend, IconHistory,
   IconChart, IconSettings, IconSun, IconMoon, IconMail,
-  IconBuilding, IconCalendar,
+  IconBuilding, IconCalendar, IconReply,
 } from "./Icons.jsx";
 
 const nav = [
@@ -12,6 +12,7 @@ const nav = [
   { to: "/companies", label: "Companies CRM", icon: IconBuilding },
   { to: "/compose", label: "Compose & Send", icon: IconSend },
   { to: "/templates", label: "Templates", icon: IconTemplate },
+  { to: "/follow-ups", label: "Replies & Follow-ups", icon: IconReply },
   { to: "/history", label: "History", icon: IconHistory },
   { to: "/calendar", label: "Calendar", icon: IconCalendar },
   { to: "/analytics", label: "Analytics", icon: IconChart },

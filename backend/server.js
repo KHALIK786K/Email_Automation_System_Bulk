@@ -13,7 +13,9 @@ import historyRouter from "./routes/history.js";
 import analyticsRouter from "./routes/analytics.js";
 import draftsRouter from "./routes/drafts.js";
 import companiesRouter from "./routes/companies.js";
+import repliesRouter from "./routes/replies.js";
 import { startScheduler } from "./scheduler.js";
+import { startReplyPoller } from "./replyPoller.js";
 
 dotenv.config();
 
@@ -44,6 +46,7 @@ app.use("/api/history", historyRouter);
 app.use("/api/analytics", analyticsRouter);
 app.use("/api/drafts", draftsRouter);
 app.use("/api/companies", companiesRouter);
+app.use("/api/replies", repliesRouter);
 
 // Serve frontend build if present (production single-server mode)
 const clientDist = join(__dirname, "..", "frontend", "dist");
@@ -59,4 +62,5 @@ app.listen(PORT, () => {
   console.log(`\n  Email Automation backend running on http://localhost:${PORT}`);
   console.log(`  API base: http://localhost:${PORT}/api\n`);
   startScheduler();
+  startReplyPoller();
 });
