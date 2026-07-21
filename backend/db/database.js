@@ -26,11 +26,10 @@ db.exec(`
     role TEXT,
     subject TEXT,
     body TEXT,
-    status TEXT DEFAULT 'pending',   -- pending | sending | sent | failed | skipped
+    status TEXT DEFAULT 'pending',   -- pending | sending | sent | failed
     error TEXT,
     template_id INTEGER,
     batch_id TEXT,
-    attachments TEXT,                -- JSON array of { filename, path } for this email
     scheduled_at TEXT,
     sent_at TEXT,
     created_at TEXT DEFAULT (datetime('now'))
@@ -75,15 +74,38 @@ db.exec(`
   );
 `);
 
-// ---- Migrations for existing databases (add columns if missing) ----
-// CREATE TABLE IF NOT EXISTS won't alter an existing table, so add new columns here.
-function ensureColumn(table, column, definition) {
-  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
-  if (!cols.includes(column)) {
+// ---- Migrations: add columns that may be missing on existing databases ----
+function columnExists(table, column) {
+  return db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === column);
+}
+function addColumnIfMissing(table, column, definition) {
+  if (!columnExists(table, column)) {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    console.log(`  [migration] added ${table}.${column}`);
   }
 }
-ensureColumn("history", "attachments", "TEXT");
+
+// SMTP Message-ID returned by nodemailer at send time. This is the key that
+// lets an incoming reply be matched back to the exact email we sent.
+// Attachment list (JSON) for this row. Persisted per-row so a restart or a
+// scheduled send never loses the brochure — the in-memory batch Map is only
+// a fast path, never the source of truth.
+addColumnIfMissing("history", "attachments", "TEXT");
+addColumnIfMissing("history", "message_id", "TEXT");
+addColumnIfMissing("history", "replied_at", "TEXT");
+addColumnIfMissing("history", "reply_from", "TEXT");
+addColumnIfMissing("history", "reply_snippet", "TEXT");
+// Full text of the reply, so it can be read (and answered) inside the app.
+addColumnIfMissing("history", "reply_body", "TEXT");
+// Set when this row is a follow-up — carries the original Message-ID so the
+// follow-up threads under the first email instead of starting a new one.
+addColumnIfMissing("history", "in_reply_to", "TEXT");
+
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_history_message_id ON history(message_id);
+  CREATE INDEX IF NOT EXISTS idx_history_email       ON history(email);
+  CREATE INDEX IF NOT EXISTS idx_history_batch       ON history(batch_id, status);
+`);
 
 // ---- Seed default settings if empty ----
 const settingsCount = db.prepare("SELECT COUNT(*) AS c FROM settings").get();
@@ -115,6 +137,7 @@ const ensureSetting = db.prepare(`
   ["contact_number", ""],
   ["website", ""],
   ["brochure_link", ""],
+  ["bulk_footer", "off"],
 ].forEach(([key, value]) => ensureSetting.run(key, value, key));
 
 // ---- Seed sample templates if missing ----

@@ -7,3 +7,9 @@ dist/
 backend/uploads/*
 backend/attachments/*
 !.gitkeep
+backend/db/*.db
+backend/db/*.db-wal
+backend/db/*.db-shm
+backend/attachments/
+backend/uploads/
+.env
